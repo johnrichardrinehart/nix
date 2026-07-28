@@ -354,6 +354,12 @@ private:
 
     AutoCloseFD openGCLock();
 
+    enum class GCLockMode { Wait, Try };
+
+    enum class GCOutcome { Completed, LockBusy };
+
+    GCOutcome collectGarbage(const GCOptions & options, GCResults & results, GCLockMode lockMode);
+
 public:
 
     Roots findRoots(bool censor) override;

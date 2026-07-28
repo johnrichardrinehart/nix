@@ -356,6 +356,11 @@ struct GCLimitReached
 
 void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 {
+    collectGarbage(options, results, GCLockMode::Wait);
+}
+
+LocalStore::GCOutcome LocalStore::collectGarbage(const GCOptions & options, GCResults & results, GCLockMode lockMode)
+{
     const auto & gcSettings = config->getLocalSettings().getGCSettings();
 
     bool shouldDelete = options.action == GCOptions::gcDeleteDead || options.action == GCOptions::gcDeleteSpecific;
@@ -368,7 +373,7 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
                 [](const GCOptions::SpecificPaths & pathsToDelete) { return pathsToDelete.paths.empty(); },
                 [](const GCOptions::WholeStore & _) { return false; }},
             options.pathsToDelete))
-        return;
+        return GCOutcome::Completed;
 
     struct Shared
     {
@@ -392,7 +397,10 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
        here because then in auto-gc mode, another thread could
        downgrade our exclusive lock. */
     auto fdGCLock = openGCLock();
-    FdLock gcLock(fdGCLock.get(), ltWrite, true, "waiting for the big garbage collector lock...");
+    FdLock gcLock(
+        fdGCLock.get(), ltWrite, lockMode == GCLockMode::Wait, "waiting for the big garbage collector lock...");
+    if (!gcLock.acquired)
+        return GCOutcome::LockBusy;
 
     /* Synchronisation point to test ENOENT handling in
        addTempRoot(), see tests/gc-non-blocking.sh. */
@@ -829,13 +837,13 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
     if (options.action == GCOptions::gcReturnLive) {
         for (auto & i : alive)
             results.paths.insert(printStorePath(i));
-        return;
+        return GCOutcome::Completed;
     }
 
     if (options.action == GCOptions::gcReturnDead) {
         for (auto & i : dead)
             results.paths.insert(printStorePath(i));
-        return;
+        return GCOutcome::Completed;
     }
 
     /* Unlink all files in /nix/store/.links that have a link count of 1,
@@ -892,6 +900,8 @@ void LocalStore::collectGarbage(const GCOptions & options, GCResults & results)
 
     /* While we're at it, vacuum the database. */
     // if (options.action == GCOptions::gcDeleteDead) vacuumDB();
+
+    return GCOutcome::Completed;
 }
 
 void LocalStore::autoGC(bool sync)
@@ -966,9 +976,10 @@ void LocalStore::autoGC(bool sync)
 
                 GCResults results;
 
-                collectGarbage(options, results);
-
-                _state->lock()->availAfterGC = getAvail();
+                if (collectGarbage(options, results, GCLockMode::Try) == GCOutcome::Completed)
+                    _state->lock()->availAfterGC = getAvail();
+                else
+                    debug("skipping auto-GC because another garbage collection is running");
 
             } catch (...) {
                 // FIXME: we could propagate the exception to the

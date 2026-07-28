@@ -1,6 +1,12 @@
 #include <gtest/gtest.h>
 
+#include <future>
+
+#include "nix/store/globals.hh"
 #include "nix/store/local-store.hh"
+#include "nix/store/pathlocks.hh"
+#include "nix/store/store-open.hh"
+#include "nix/util/file-system.hh"
 
 // Needed for template specialisations. This is not good! When we
 // overhaul how store configs work, this should be fixed.
@@ -71,5 +77,44 @@ TEST(LocalStore, constructConfig_to_string)
     LocalStoreConfig config{"", {}};
     EXPECT_EQ(config.getReference().to_string(), "local");
 }
+
+#ifndef _WIN32
+
+TEST(LocalStore, autoGCDoesNotWaitForGCLock)
+{
+    auto tmpRoot = createTempDir();
+    createDirs(tmpRoot / "nix/store");
+
+    auto store = openStore(fmt("local?root=%s", tmpRoot.string())).dynamic_pointer_cast<LocalStore>();
+    ASSERT_NE(store, nullptr);
+
+    auto & gcSettings = settings.getLocalSettings().getGCSettings();
+    auto oldMinFree = gcSettings.minFree.get();
+    auto oldMaxFree = gcSettings.maxFree.get();
+    auto oldMinFreeCheckInterval = gcSettings.minFreeCheckInterval.get();
+    Finally restoreSettings([&]() {
+        gcSettings.minFree = oldMinFree;
+        gcSettings.maxFree = oldMaxFree;
+        gcSettings.minFreeCheckInterval = oldMinFreeCheckInterval;
+    });
+    gcSettings.minFree = std::numeric_limits<uint64_t>::max() - 1;
+    gcSettings.maxFree = std::numeric_limits<uint64_t>::max();
+    gcSettings.minFreeCheckInterval = 0;
+
+    std::future<void> autoGC;
+    std::future_status status;
+    {
+        auto gcLockFile = openLockFile(tmpRoot / "nix/var/nix/gc.lock", true);
+        FdLock gcLock(gcLockFile.get(), ltWrite, true, "");
+
+        autoGC = std::async(std::launch::async, [&]() { store->autoGC(); });
+        status = autoGC.wait_for(std::chrono::seconds(2));
+    }
+    autoGC.get();
+
+    EXPECT_EQ(status, std::future_status::ready);
+}
+
+#endif
 
 } // namespace nix
